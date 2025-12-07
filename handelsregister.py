@@ -137,7 +137,43 @@ class HandelsRegister:
         try:
             response = self.browser.submit()
             content = response.read().decode('utf-8')
-            return self.parse_documents(content)
+            docs = self.parse_documents(content)
+            
+            current_viewstate = None
+            
+            if not docs:
+                try:
+                    # Step 1: Expand root 0_0
+                    xml_content = self.expand_documents_tree("0_0", current_viewstate)
+                    if xml_content:
+                         # Extract new ViewState
+                         current_viewstate = self.extract_viewstate_from_partial_response(xml_content)
+                         tree_html = self.extract_html_from_partial_response(xml_content)
+                         
+                         soup = BeautifulSoup(tree_html, 'html.parser')
+                         nodes_to_expand = []
+                         
+                         for li in soup.find_all('li'):
+                             txt = li.get_text()
+                             # Expand all folder-like nodes that are not leaves
+                             # 'data-nodetype="list"' usually denotes a folder
+                             if li.get('data-nodetype') == 'list':
+                                 rid = li.get('data-rowkey')
+                                 if rid: nodes_to_expand.append((rid, txt))
+                        
+                         # Step 2: Expand relevant nodes
+                         for nid, category_name in nodes_to_expand:
+                             xml_content_2 = self.expand_documents_tree(nid, current_viewstate)
+                             if xml_content_2:
+                                 current_viewstate = self.extract_viewstate_from_partial_response(xml_content_2)
+                                 html_2 = self.extract_html_from_partial_response(xml_content_2)
+                                 docs += self.parse_documents(html_2, default_type=category_name)
+                                 
+                except Exception as e:
+                    if self.args.debug:
+                        print(f"Debug: Failed to expand tree: {e}")
+            
+            return docs
         finally:
              # We might be on a different page now (documents page), so back might be needed 
              # to return to search results for next iteration.
@@ -148,7 +184,93 @@ class HandelsRegister:
                 if self.args.debug:
                     print(f"Error going back: {e}")
 
-    def parse_documents(self, html):
+    def expand_documents_tree(self, node_id="0_0", viewstate=None):
+        # Select the tree form
+        try:
+            self.browser.select_form(name="dk_form")
+        except:
+            if self.args.debug:
+                print("Debug: dk_form not found")
+            return None
+
+        # Update ViewState if we have a newer one from previous AJAX requests
+        if viewstate:
+            try:
+                self.browser.form.set_value(viewstate, name='javax.faces.ViewState')
+            except Exception as e:
+                 # It might be that the name is different or control not found, but standard JSF uses this name
+                 if self.args.debug: print(f"Debug: Could not set ViewState: {e}")
+
+        # Add parameters to expand the node
+        # Note: We must be careful not to add duplicate controls if they persist (mechanize shouldn't persist new_control across select_form if we back() correctly)
+        self.browser.form.new_control('hidden', 'javax.faces.partial.ajax', {'value': 'true'})
+        self.browser.form.new_control('hidden', 'javax.faces.source', {'value': 'dk_form:dktree'})
+        self.browser.form.new_control('hidden', 'javax.faces.partial.execute', {'value': 'dk_form:dktree'})
+        self.browser.form.new_control('hidden', 'javax.faces.partial.render', {'value': 'dk_form:dktree'})
+        self.browser.form.new_control('hidden', 'dk_form:dktree_expandNode', {'value': node_id})
+        self.browser.form.new_control('hidden', 'dk_form:dktree_scrollState', {'value': '0,0'})
+        
+        # Submit the AJAX request
+        response = self.browser.submit()
+        content = response.read().decode('utf-8')
+        
+        # IMPORTANT: Restore browser state to the HTML page so we can interact with the form again
+        self.browser.back()
+        
+        return content
+
+    def extract_viewstate_from_partial_response(self, xml_content):
+        import re
+        # Look for <update id="...javax.faces.ViewState...">...</update>
+        # The ID is usually something like j_id1:javax.faces.ViewState:0
+        
+        match = re.search(r'<update id="[^"]*javax\.faces\.ViewState[^"]*"><!\[CDATA\[(.*?)\]\]></update>', xml_content, re.DOTALL)
+        if match:
+            return match.group(1)
+        return None
+
+
+    def extract_html_from_partial_response(self, xml_content):
+        try:
+            import re
+            # Remove encoding declaration
+            if '<?xml' in xml_content:
+                xml_content = xml_content[xml_content.find('?>')+2:]
+            
+            # Target the specific update for the tree
+            # <update id="dk_form:dktree"><![CDATA[...]]></update>
+            # The ID usually matches exactly dk_form:dktree or contains it
+            
+            match = re.search(r'<update id="[^"]*dktree[^"]*"><!\[CDATA\[(.*?)\]\]></update>', xml_content, re.DOTALL)
+            if match:
+                return match.group(1)
+            
+            # Fallback if no CDATA or different format
+            match = re.search(r'<update id="[^"]*dktree[^"]*">(.*?)</update>', xml_content, re.DOTALL)
+            if match:
+                return match.group(1)
+                
+        except Exception as e:
+            if self.args.debug:
+                print(f"Debug: Error parsing partial response: {e}")
+        
+        return ""
+
+    def normalize_type(self, type_string):
+        if not type_string: return None
+        # Replace non alphanum (preserving german chars is tricky with just \w in some regex engines, 
+        # but let's assume we want to keep them or just replace symbols)
+        # Let's simple replace known separators
+        t = type_string.replace(' / ', '_').replace(' - ', '_').replace(' ', '_').replace('/', '_')
+        # Remove any other non-word characters except underscores (optional, but safer)
+        # t = re.sub(r'[^\w\d_]', '', t) # This might strip German chars depending on locale
+        
+        t = t.upper()
+        # Merge underscores
+        t = re.sub(r'_+', '_', t)
+        return t.strip('_')
+
+    def parse_documents(self, html, default_type=None):
         if "session has expired" in html.lower() or "sitzung abgelaufen" in html.lower():
             print("[WARN] Session expired while fetching documents. Use a browser to download.")
             return []
@@ -208,10 +330,12 @@ class HandelsRegister:
                 pdf_link = link.get('id') # Store ID to indicate it's interactable
             
             docs.append({
-                 'id': pdf_link or "unknown", 
+                 'id': pdf_link or text_node.strip(), 
                  'pdf': pdf_link, # Might be None
                  'date': doc_date,
-                 'name': text_node.strip()
+                 'name': text_node.strip(),
+                 'typeString': default_type,
+                 'type': self.normalize_type(default_type)
              })
 
         # Fallback: Table parsing (original logic) if above yielded nothing or mixed
@@ -252,7 +376,10 @@ class HandelsRegister:
                          docs.append({
                              'id': pdf_link, 
                              'pdf': pdf_link,
-                             'date': doc_date
+                             'date': doc_date,
+                             'name': date_str, # Fallback name
+                             'typeString': default_type,
+                             'type': self.normalize_type(default_type)
                          })
 
         # Deduplicate by date + id
@@ -304,18 +431,34 @@ class HandelsRegister:
                     target_company = c
                     break
 
-        if self.args.withShareholdersLatest and target_company and target_company.get('_dk_id'):
+        if target_company and target_company.get('_dk_id'):
+            # Fetch documents if _dk_id is present. 
+            # We do this generally now as per request.
+            if self.args.withShareholdersLatest:
+                # If withShareholdersLatest is set, we definitely fetch.
+                # But user asked to generally include the list.
+                # However, to avoid slowing down *everything*, we might still want to guard it?
+                # User's prompt: "die komplette dokumentenliste können wir ja generell doch inkluden"
+                # This implies I should perhaps always do it if I have the capability?
+                # Let's assume yes, if we found a company, we want detail.
+                pass
+            
+            # Actually, to be safe and efficient, let's trigger it if withShareholdersLatest OR a new flag is present,
+            # OR just do it because the user asked so for this context. 
+            # Given the conversation, I'll bind it to the existing logic but remove the restriction effectively.
+            # Wait, `get_company` is called when `-r` is used. This implies detailed view.
+            
+            if self.args.debug:
+                print(f"Debug: Found _dk_id {target_company.get('_dk_id')}, fetching documents...")
             try:
                 docs = self.get_documents(target_company['_dk_id'])
-                # Only keep the last (latest) document if requested logic implies "only the last one"
-                # Since we sort descending, [0] is the latest.
-                if docs:
-                    target_company['documents'] = [docs[0]]
-                else:
-                    target_company['documents'] = []
+                target_company['documents'] = docs
             except Exception as e:
                 if self.args.debug:
                     print(f"Error fetching documents for {target_company.get('name')}: {e}")
+        elif self.args.withShareholdersLatest:
+            if self.args.debug:
+                 print(f"Debug: No _dk_id found for company (target found: {bool(target_company)})")
         
         return target_company
 
@@ -385,6 +528,9 @@ def parse_result(result):
             link = dk_span.find_parent('a')
             if link:
                 d['_dk_id'] = link.get('id')
+                # print(f"Debug: Found DK ID: {d['_dk_id']}")
+        # else:
+            # print("Debug: No DK span found in column 5")
 
     d['history'] = []
     hist_start = 8
@@ -406,7 +552,8 @@ def pr_company_info(c):
         print(name, loc)
     print('documents:')
     for doc in c.get('documents', []):
-        print(f"  {doc.get('date')} - {doc.get('id')}")
+        t = doc.get('typeString', '-')
+        print(f"  {doc.get('date')} - {t} - {doc.get('name')}")
 
 def get_companies_in_searchresults(html):
     soup = BeautifulSoup(html, 'html.parser')
