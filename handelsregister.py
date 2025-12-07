@@ -13,6 +13,7 @@ import sys
 from bs4 import BeautifulSoup
 import urllib.parse
 import datetime
+import base64
 
 # Dictionaries to map arguments to values
 schlagwortOptionen = {
@@ -33,7 +34,7 @@ class HandelsRegister:
         self.browser.set_handle_robots(False)
         self.browser.set_handle_equiv(True)
         self.browser.set_handle_gzip(True)
-        self.browser.set_handle_refresh(False)
+        self.browser.set_handle_refresh(True)
         self.browser.set_handle_redirect(True)
         self.browser.set_handle_referer(True)
 
@@ -173,6 +174,24 @@ class HandelsRegister:
                     if self.args.debug:
                         print(f"Debug: Failed to expand tree: {e}")
             
+            if self.args.withShareholdersLatest and docs:
+                 s_docs = [d for d in docs if d.get('name') and 'gesellschafter' in d['name'].lower()]
+                 if not s_docs:
+                      s_docs = [d for d in docs if d.get('type') and 'GESELLSCHAFTER' in d['type']]
+                 
+                 if s_docs:
+                      latest = s_docs[0]
+                      if self.args.debug:
+                           print(f"Found latest shareholder list (internal): {latest['name']}")
+                      
+                      pdf_content = self.download_pdf(latest['pdf'])
+                      if not pdf_content and latest.get('rowkey'):
+                           if self.args.debug: print(f"Downloading via rowkey {latest['rowkey']}")
+                           pdf_content = self.download_pdf_via_rowkey(latest['rowkey'])
+                           
+                      if pdf_content:
+                           latest['pdf_base64'] = base64.b64encode(pdf_content).decode('utf-8')
+
             return docs
         finally:
              # We might be on a different page now (documents page), so back might be needed 
@@ -329,11 +348,31 @@ class HandelsRegister:
             if pdf_link == '#':
                 pdf_link = link.get('id') # Store ID to indicate it's interactable
             
+            name = text_node.strip()
+            rowkey = None
+            if not pdf_link:
+                 # Try to find rowkey in 'li' parent
+                 # hierarchy: text -> span(label) -> span(content) -> li
+                 curr = node_parent
+                 for _ in range(4): # check up to 4 levels up
+                      if curr and curr.name == 'li' and curr.has_attr('data-rowkey'):
+                           rowkey = curr['data-rowkey']
+                           break
+                      curr = curr.parent if curr else None
+
+            if self.args.debug and not pdf_link and "gesellschafter" in name.lower():
+                 print(f"DEBUG: Found Gesellschafter but no PDF link. Node parent: {node_parent}")
+                 if rowkey:
+                      print(f"DEBUG: Found rowkey: {rowkey}")
+                 elif node_parent and node_parent.parent:
+                      print(f"DEBUG: Node grandparent: {node_parent.parent}")
+
             docs.append({
-                 'id': pdf_link or text_node.strip(), 
+                 'id': pdf_link or name, 
                  'pdf': pdf_link, # Might be None
+                 'rowkey': rowkey,
                  'date': doc_date,
-                 'name': text_node.strip(),
+                 'name': name,
                  'typeString': default_type,
                  'type': self.normalize_type(default_type)
              })
@@ -391,6 +430,150 @@ class HandelsRegister:
         sorted_docs = sorted(unique_docs.values(), key=lambda x: x['date'], reverse=True)
         return sorted_docs
 
+    def download_pdf(self, url):
+        if not url or url.startswith('#') or (':' in url and not url.startswith('http')):
+             return None
+        try:
+            resp = self.browser.open(url)
+            return resp.read()
+        except Exception as e:
+            if self.args.debug:
+                 print(f"Failed to download PDF: {e}")
+            return None
+
+    def download_pdf_via_rowkey(self, rowkey):
+        if not rowkey: return None
+        try:
+            self.browser.select_form(name="dk_form")
+            
+            self.browser.form.new_control('hidden', 'javax.faces.partial.ajax', {'value': 'true'})
+            self.browser.form.new_control('hidden', 'javax.faces.source', {'value': 'dk_form:dktree'})
+            self.browser.form.new_control('hidden', 'javax.faces.partial.execute', {'value': 'dk_form:dktree'})
+            # Trying specifically to update the whole form to see download links
+            self.browser.form.new_control('hidden', 'javax.faces.partial.render', {'value': 'dk_form'}) 
+            self.browser.form.new_control('hidden', 'dk_form:dktree_selection', {'value': rowkey})
+            self.browser.form.new_control('hidden', 'javax.faces.behavior.event', {'value': 'select'})
+            
+            response = self.browser.submit()
+
+            xml_content = response.read().decode('utf-8')
+            
+            new_viewstate = self.extract_viewstate_from_partial_response(xml_content)
+            
+            self.browser.back()
+            
+            import re
+            btn_match = re.search(r'<button[^>]*name="([^"]+)"[^>]*>.*?Download.*?</button>', xml_content, re.DOTALL | re.IGNORECASE)
+            
+            if not btn_match:
+                 btn_match = re.search(r'<input[^>]*name="([^"]+)"[^>]*value="Download"[^>]*>', xml_content, re.DOTALL | re.IGNORECASE)
+                 
+            if not btn_match and self.args.debug:
+                 print(f"DEBUG: No Download button found in AJAX response. Content length: {len(xml_content)}")
+                 print(f"DEBUG: content snippet: {xml_content[:1000]}")
+
+            if btn_match:
+                 btn_name = btn_match.group(1)
+                 if self.args.debug: 
+                     print(f"DEBUG: Found download button in AJAX response: {btn_name}")
+                 
+                 if self.args.debug: print("DEBUG: Reloading page to sync state...")
+                 self.browser.open(self.browser.geturl())
+                 
+                 self.browser.select_form(name="dk_form")
+                 
+                 try:
+                     self.browser.form.find_control(btn_name) # Verification
+                     if self.args.debug: print(f"DEBUG: Button {btn_name} found in reloaded form.")
+                     
+                     dl_response = self.browser.submit(name=btn_name)
+                 except Exception as e:
+                     if self.args.debug: print(f"DEBUG: Could not find/click button {btn_name} in reloaded page: {e}")
+                     # Fallback: force it like before, but on the fresh form
+                     try:
+                        self.browser.form.new_control('hidden', btn_name, {'value': ''})
+                        dl_response = self.browser.submit()
+                     except Exception as e2:
+                        print(f"WARN: Failed to forcedly submit download button: {e2}", file=sys.stderr)
+                        return None
+
+                 ct = dl_response.info().get_content_type()
+                 
+                 # Relaxed content type check
+                 if 'pdf' in ct or 'octet-stream' in ct or 'zip' in ct:
+                      content = dl_response.read()
+                      
+                      # Handle ZIP response (Handelsregister sometimes zips files)
+                      if content.startswith(b'PK'):
+                           if self.args.debug: print("DEBUG: Response is a ZIP file. Extracting PDF...")
+                           import zipfile
+                           import io
+                           try:
+                               with zipfile.ZipFile(io.BytesIO(content)) as z:
+                                   # Find first PDF
+                                   for name in z.namelist():
+                                       if name.lower().endswith('.pdf'):
+                                           if self.args.debug: print(f"DEBUG: Extracted {name} from ZIP.")
+                                           content = z.read(name)
+                                           break
+                           except Exception as e:
+                               print(f"WARN: Failed to extract ZIP: {e}", file=sys.stderr)
+                               # If we can't unzip, we can't give a PDF.
+                               return None
+                      
+                      self.browser.back()
+                      return content
+
+                 # If we are here, it's not a known binary type; check for "Please wait" page
+                 try:
+                      content = dl_response.read()
+                      
+                      if b"Bitte warten" in content:
+                           if b"ui-hidden-container" in content and b"Bitte warten" in content:
+                               if self.args.debug: print("DEBUG: 'Bitte warten' text found but likely hidden. Ignoring 'Please wait' warning.", file=sys.stderr)
+                           else:
+                               print("WARN: Enountered 'Please wait' page. This page requires JavaScript to proceed, which is not supported.", file=sys.stderr)
+                               if self.args.debug:
+                                    print(f"DEBUG: Response URL: {dl_response.geturl()}")
+                 except: 
+                      pass
+                        
+                 self.browser.back()
+                 return None
+            
+            # Fallback to link search if button not found (unlikely given XML analysis)
+            links = re.findall(r'href=["\']([^"\']+)["\']', xml_content)
+            
+            for link in links:
+                 # Skip JS, hash, resources
+                 if link.startswith('#') or link.startswith('javascript'): continue
+                 if 'javax.faces.resource' in link: continue
+                 
+                 # Prioritize likely download links
+                 # Often they are just relative links like 'documents/...'
+                 full_link = urllib.parse.urljoin(self.browser.geturl(), link)
+                 
+                 # Optimization: avoid fetching unrelated pages
+                 # But we don't know the exact pattern.
+                 
+                 # Try to download
+                 try:
+                      res = self.browser.open(full_link)
+                      # Check content type?
+                      ct = res.info().get_content_type()
+                      if ct == 'application/pdf':
+                           return res.read()
+                      # If not PDF, maybe skip?
+                 except:
+                      pass
+            
+            return None
+
+        except Exception as e:
+            if self.args.debug:
+                 print(f"Error downloading via rowkey: {e}")
+            return None
+
     def get_company(self, register_num):
         """
         Fetch a specific company by its register number and retrieve its documents.
@@ -432,27 +615,21 @@ class HandelsRegister:
                     break
 
         if target_company and target_company.get('_dk_id'):
-            # Fetch documents if _dk_id is present. 
-            # We do this generally now as per request.
-            if self.args.withShareholdersLatest:
-                # If withShareholdersLatest is set, we definitely fetch.
-                # But user asked to generally include the list.
-                # However, to avoid slowing down *everything*, we might still want to guard it?
-                # User's prompt: "die komplette dokumentenliste können wir ja generell doch inkluden"
-                # This implies I should perhaps always do it if I have the capability?
-                # Let's assume yes, if we found a company, we want detail.
-                pass
-            
-            # Actually, to be safe and efficient, let's trigger it if withShareholdersLatest OR a new flag is present,
-            # OR just do it because the user asked so for this context. 
-            # Given the conversation, I'll bind it to the existing logic but remove the restriction effectively.
-            # Wait, `get_company` is called when `-r` is used. This implies detailed view.
-            
             if self.args.debug:
                 print(f"Debug: Found _dk_id {target_company.get('_dk_id')}, fetching documents...")
             try:
                 docs = self.get_documents(target_company['_dk_id'])
                 target_company['documents'] = docs
+
+                if self.args.withShareholdersLatest:
+                     target_company['documentShareholdersLatest'] = None
+                     if docs:
+                         for d in docs:
+                              if d.get('pdf_base64'):
+                                   target_company['documentShareholdersLatest'] = d['pdf_base64']
+                                   break
+
+
             except Exception as e:
                 if self.args.debug:
                     print(f"Error fetching documents for {target_company.get('name')}: {e}")
