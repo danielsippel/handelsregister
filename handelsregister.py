@@ -101,7 +101,6 @@ class HandelsRegister:
                             print(f"Failed to set register number fields: {e}")
             
             if not reg_parsed:
-                # Fallback to keywords
                  self.browser["form:schlagwoerter"] = self.args.schlagwoerter
                  
             so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
