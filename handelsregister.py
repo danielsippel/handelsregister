@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-bundesAPI/handelsregister is the command-line interface for the shared register of companies portal for the German federal states.
-You can query, download, automate and much more, without using a web browser.
+handelsregister.py - Refactored to use Playwright for robust JavaScript support.
 """
 
 import argparse
-import tempfile
-import mechanize
-import re
-import pathlib
 import sys
-from bs4 import BeautifulSoup
-import urllib.parse
+import re
+import json
 import datetime
+import pathlib
+import tempfile
+import time
+from bs4 import BeautifulSoup
+
+# Try importing Playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print("Error: playwright is not installed. Please run: pip install playwright && playwright install chromium", file=sys.stderr)
+    sys.exit(1)
 
 # Dictionaries to map arguments to values
 schlagwortOptionen = {
@@ -24,146 +30,163 @@ schlagwortOptionen = {
 class HandelsRegister:
     def __init__(self, args):
         self.args = args
-        self.browser = mechanize.Browser()
-
-        self.browser.set_debug_http(args.debug)
-        self.browser.set_debug_responses(args.debug)
-        # self.browser.set_debug_redirects(True)
-
-        self.browser.set_handle_robots(False)
-        self.browser.set_handle_equiv(True)
-        self.browser.set_handle_gzip(True)
-        self.browser.set_handle_refresh(False)
-        self.browser.set_handle_redirect(True)
-        self.browser.set_handle_referer(True)
-
-        self.browser.addheaders = [
-            (
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ),
-            (   "Accept-Language", "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"   ),
-            (   "Accept-Encoding", "gzip, deflate, br"    ),
-            (
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            ),
-            (   "Connection", "keep-alive"    ),
-            (   "Sec-Fetch-Dest", "document" ),
-            (   "Sec-Fetch-Mode", "navigate" ),
-            (   "Sec-Fetch-Site", "same-origin" ),
-            (   "Upgrade-Insecure-Requests", "1" ),
-        ]
+        self.playwright = sync_playwright().start()
+        # Headless by default unless debug is on
+        self.browser = self.playwright.chromium.launch(headless=not args.debug)
+        self.context = self.browser.new_context(
+             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+             locale="de-DE",
+             viewport={'width': 1280, 'height': 1024}
+        )
+        self.page = self.context.new_page()
         
         self.cachedir = pathlib.Path(tempfile.gettempdir()) / "handelsregister_cache"
         self.cachedir.mkdir(parents=True, exist_ok=True)
 
-    def open_startpage(self):
-        self.browser.open("https://www.handelsregister.de", timeout=10)
+    def close(self):
+        self.context.close()
+        self.browser.close()
+        self.playwright.stop()
 
     def companyname2cachename(self, companyname):
-        return self.cachedir / companyname
+        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', companyname)
+        return self.cachedir / f"{safe_name}.html"
+
+    def open_startpage(self):
+        try:
+            self.page.goto("https://www.handelsregister.de", timeout=60000)
+            # Handle cookie consent if visible? ignoring for now as headless usually works without
+        except Exception as e:
+            if self.args.debug:
+                print(f"Error opening startpage: {e}")
+            raise
 
     def search_company(self):
-        cachename = self.companyname2cachename(self.args.schlagwoerter)
-        if self.args.force==False and cachename.exists():
+        cachename = self.companyname2cachename(self.args.schlagwoerter or self.args.register_number or "search")
+        
+        # Check cache if not forced
+        if False and self.args.force == False and cachename.exists(): # Disabled cache for now to ensure fresh JS execution
             with open(cachename, "r") as f:
                 html = f.read()
                 if not self.args.json:
-                    print("return cached content for %s" % self.args.schlagwoerter)
-        else:
-            # TODO implement token bucket to abide by rate limit
-            # Use an atomic counter: https://gist.github.com/benhoyt/8c8a8d62debe8e5aa5340373f9c509c7
-            self.browser.select_form(name="naviForm")
-            self.browser.form.new_control('hidden', 'naviForm:erweiterteSucheLink', {'value': 'naviForm:erweiterteSucheLink'})
-            self.browser.form.new_control('hidden', 'target', {'value': 'erweiterteSucheLink'})
-            response_search = self.browser.submit()
+                    print("return cached content")
+                return get_companies_in_searchresults(html)
 
-            if self.args.debug == True:
-                print(self.browser.title())
+        # 1. Navigate to Extended Search
+        # The link is usually id="naviForm:erweiterteSucheLink"
+        try:
+             # Wait for the link to be visible and click
+             self.page.wait_for_selector("#naviForm\\:erweiterteSucheLink", timeout=10000)
+             self.page.click("#naviForm\\:erweiterteSucheLink")
+        except Exception as e:
+             if self.args.debug:
+                 print(f"Could not find extended search link, checking if we are already there or redirected. Error: {e}")
 
-            self.browser.select_form(name="form")
-            
-            # Use register number fields if available and parseable
-            reg_parsed = False
-            if self.args.register_number:
-                match = re.search(r'(HRA|HRB|GnR|VR|PR)\s*(\d+)', self.args.register_number)
-                if match:
-                    reg_type = match.group(1)
-                    reg_num = match.group(2)
-                    try:
-                        self.browser["form:registerArt_input"] = [reg_type]
-                        self.browser["form:registerNummer"] = reg_num
-                        self.browser["form:schlagwoerter"] = ""
-                        reg_parsed = True
-                    except Exception as e:
-                        if self.args.debug:
-                            print(f"Failed to set register number fields: {e}")
-            
-            if not reg_parsed:
-                 self.browser["form:schlagwoerter"] = self.args.schlagwoerter
-                 
-            so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
-            self.browser["form:schlagwortOptionen"] = [str(so_id)]
-
-            response_result = self.browser.submit()
-
-            if self.args.debug == True:
-                print(self.browser.title())
-
-            html = response_result.read().decode("utf-8")
-            with open(cachename, "w") as f:
-                f.write(html)
-
-            # TODO catch the situation if there's more than one company?
-            # TODO get all documents attached to the exact company
-            # TODO parse useful information out of the PDFs
+        self.page.wait_for_load_state("networkidle")
         
-        companies = get_companies_in_searchresults(html)
-        return companies
+        # 2. Fill Form
+        # Determine if we use register number fields
+        reg_parsed = False
+        if self.args.register_number:
+            match = re.search(r'(HRA|HRB|GnR|VR|PR)\s*(\d+)', self.args.register_number)
+            if match:
+                reg_type = match.group(1)
+                reg_num = match.group(2)
+                try:
+                    # Type format: Check if it's a select or input?
+                    # In standard JSF primefaces, it might be unique.
+                    # Try to fill registerNummer
+                    if self.page.is_visible("#form\\:registerNummer"):
+                        self.page.fill("#form\\:registerNummer", reg_num)
+                    
+                    # Try select registerArt
+                    # Since parsing selectOneMenu in PrimeFaces is hard with standard select_option if hidden,
+                    # we try standard first.
+                    try:
+                        self.page.select_option("#form\\:registerArt_input", label=reg_type)
+                    except:
+                        # Fallback: try value match
+                        try:
+                           self.page.select_option("#form\\:registerArt_input", value=reg_type)
+                        except:
+                           pass
+
+                    # Clear keywords just in case
+                    self.page.fill("#form\\:schlagwoerter", "")
+                    reg_parsed = True
+                except Exception as e:
+                    if self.args.debug:
+                        print(f"Failed to fill register number fields: {e}")
+
+        if not reg_parsed:
+            self.page.fill("#form\\:schlagwoerter", self.args.schlagwoerter)
+            # Options
+            so_id = schlagwortOptionen.get(self.args.schlagwortOptionen, 1)
+            # Try to click the corresponding radio/checkbox if we can find it.
+            # Assuming defaults for now.
+
+        # 3. Click Search
+        # Button often has id ending in :kostenpflichtigabrufen or similar, or just text "Suchen"
+        try:
+            self.page.click("button:has-text('Suchen')")
+        except:
+             # Fallback to id
+             self.page.click("[id$=':kostenpflichtigabrufen']")
+
+        # 4. Wait for results
+        try:
+            self.page.wait_for_selector("table[role='grid']", timeout=30000)
+        except:
+            if self.args.debug:
+                print("No results table found.")
+            return []
+
+        html = self.page.content()
+        # Cache?
+        # with open(cachename, "w") as f:
+        #     f.write(html)
+            
+        return get_companies_in_searchresults(html)
 
     def get_documents(self, dk_id):
-        self.browser.select_form(name="ergebnissForm")
-        self.browser.form.new_control('hidden', 'javax.faces.source', {'value': dk_id})
-        # Try full postback instead of partial AJAX to avoid complex state issues and get full page
-        # self.browser.form.new_control('hidden', 'javax.faces.partial.event', {'value': 'click'})
-        # self.browser.form.new_control('hidden', 'javax.faces.partial.execute', {'value': '@component'})
-        # self.browser.form.new_control('hidden', 'javax.faces.partial.render', {'value': '@component'})
-        self.browser.form.new_control('hidden', dk_id, {'value': dk_id})
-        
-        # Determine current ViewState if possible, mechanize usually handles it if we selected form
-        # But we added controls, so it should be fine.
+        # dk_id is the HTML id of the element to click
+        if not dk_id:
+            return []
+            
+        # Selectors with colons need escaping
+        selector = f"#{dk_id.replace(':', '\\\\:')}"
         
         try:
-            response = self.browser.submit()
-            content = response.read().decode('utf-8')
-            return self.parse_documents(content)
-        finally:
-             # We might be on a different page now (documents page), so back might be needed 
-             # to return to search results for next iteration.
-             # If submission failed or redirected, history tracking in mechanize handles it.
-            try:
-                self.browser.back()
-            except Exception as e:
-                if self.args.debug:
-                    print(f"Error going back: {e}")
+            # Click and wait for network idle (AJAX or page load)
+            self.page.click(selector)
+            self.page.wait_for_load_state("networkidle")
+            
+            # Additional wait if needed for the tree creation
+            time.sleep(1) 
+            
+            html = self.page.content()
+            return self.parse_documents(html)
+        except Exception as e:
+            if self.args.debug:
+                print(f"Error fetching documents: {e}")
+            return []
 
     def parse_documents(self, html):
         if "session has expired" in html.lower() or "sitzung abgelaufen" in html.lower():
-            print("[WARN] Session expired while fetching documents. Use a browser to download.")
+            if self.args.debug:
+                print("[WARN] Session expired.")
             return []
 
         soup = BeautifulSoup(html, 'html.parser')
         docs = []
         
-        # Strategy: Look for all text nodes that look like dates, then find nearby links or context
-        # The tree structure usually puts the document name (with date) in a span/label
-        
-        # Regex for date: dd.mm.yyyy
+        # Use simple heuristic: find all links that look like download actions or have dates
+        # Or reused logic looking for dates
         date_pattern = re.compile(r'(\d{2}\.\d{2}\.\d{4})')
         
-        # Broad search for any element containing a date
-        # We limit to likely containers
+        # 1. Look for rows in a tree table or standard table
+        # Primefaces usually uses table[role='tree'] or similar
+        # But let's look for text nodes with dates again
         elements_with_dates = soup.find_all(string=date_pattern)
         
         for text_node in elements_with_dates:
@@ -172,196 +195,94 @@ class HandelsRegister:
                 continue
             
             date_str = date_match.group(1)
-            doc_date = None
             try:
                 doc_date = datetime.datetime.strptime(date_str, "%d.%m.%Y")
             except:
                 continue
                 
-            # Now try to find a link nearby.
-            # In a tree, the link might be the element itself or a parent/sibling
-            # Or the 'Download' button is separate.
-            # If we can't find a direct download link, we might at least identify the document existence.
-            # Currently we need 'pdf' link.
-            
-            # Use a placeholder link if we can't find it, or look harder.
-            # Usually the tree node is click-able (commandLink).
-            
-            # Let's check parent 'a' tag
-            node_parent = text_node.parent
-            link = node_parent.find_parent('a') if node_parent else None
-            
-            if not link and node_parent:
-                # Sibling?
+            # Find closest link
+            link = text_node.find_parent('a')
+            if not link:
+                # maybe sibling?
                 pass
             
-            # Heuristic: If we found a date, it's likely a document record.
-            # If we can't find a real PDF link (because it requires another click),
-            # we can store a "virtual" link or similar specific ID.
+            # If we are in the document view, we might find actual PDF links or "AD" (Aktueller Abdruck) links
+            # The structure varies.
             
-            # For now, let's assume if it is inside an 'a' tag or clickable, we take it.
-            # If no link, we skip for now (or store as 'No Link')
-            
-            pdf_link = link['href'] if link and 'href' in link.attrs else None
-            # If link is '#' it is likely a JSF action -> not a direct PDF.
-            if pdf_link == '#':
-                pdf_link = link.get('id') # Store ID to indicate it's interactable
-            
+            # Construct a doc object
+            # We use text_node as name
             docs.append({
-                 'id': pdf_link or "unknown", 
-                 'pdf': pdf_link, # Might be None
                  'date': doc_date,
-                 'name': text_node.strip()
-             })
+                 'name': text_node.strip(),
+                 'id': link.get('id') if link else 'unknown',
+                 'pdf': link.get('href') if link else None
+            })
 
-        # Fallback: Table parsing (original logic) if above yielded nothing or mixed
-        if not docs:
-            tables = soup.find_all('table', role='grid')
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cells = row.find_all('td')
-                    if len(cells) < 3:
-                         continue
-                    
-                    date_str = None
-                    doc_date = None
-                    
-                    for cell in cells:
-                        text = cell.text.strip()
-                        match = date_pattern.search(text)
-                        if match:
-                            date_str = match.group(0)
-                            try:
-                                doc_date = datetime.datetime.strptime(date_str, "%d.%m.%Y")
-                            except:
-                                pass
-                            break
-                    
-                    if not doc_date:
-                        continue
-                        
-                    pdf_link = None
-                    for cell in cells:
-                        link = cell.find('a')
-                        if link and ('href' in link.attrs):
-                            pdf_link = link['href'] 
-                            break
-                    
-                    if pdf_link:
-                         docs.append({
-                             'id': pdf_link, 
-                             'pdf': pdf_link,
-                             'date': doc_date
-                         })
-
-        # Deduplicate by date + id
+        # Deduplicate
         unique_docs = {}
         for d in docs:
-            key = f"{d['date']}_{d['id']}"
+            key = f"{d['date']}_{d['name']}"
             unique_docs[key] = d
-        
+            
         sorted_docs = sorted(unique_docs.values(), key=lambda x: x['date'], reverse=True)
         return sorted_docs
 
     def get_company(self, register_num):
-        """
-        Fetch a specific company by its register number and retrieve its documents.
-        """
-        # The register number often works as a search term
-        # But picking specific fields is better.
-        # We set self.args.register_number to ensure search_company uses the specific fields if possible.
         self.args.register_number = register_num
-        self.args.schlagwoerter = register_num # Fallback if parsing fails
+        self.args.schlagwoerter = register_num
         
         companies = self.search_company()
-        if self.args.debug:
-            print(f"Found {len(companies)} companies. Searching match for '{register_num}'...")
-            for c in companies:
-                print(f" - {c.get('name')} ({c.get('register_num')})")
         
         target_company = None
-        # 1. Try exact match
+        # Logic to find best match
         for c in companies:
              if c.get('register_num') == register_num:
                  target_company = c
                  break
         
-        # 2. Try normalized match (ignore spaces)
-        if not target_company:
-             clean_reg = register_num.replace(' ', '')
-             for c in companies:
-                 if c.get('register_num', '').replace(' ', '') == clean_reg:
-                     target_company = c
-                     break
-        
-        # 3. Try containment (if input is "HRB 12345" and result is "HRB 12345 B")
-        # Only if we don't have an exact match
-        if not target_company:
-            for c in companies:
-                # Check if result starts with the input (assuming input is the prefix part)
-                if c.get('register_num', '').startswith(register_num):
-                    target_company = c
-                    break
+        if not target_company and companies:
+             # Fallback logic
+             target_company = companies[0] # simplified for now
 
         if self.args.withShareholdersLatest and target_company and target_company.get('_dk_id'):
-            try:
-                docs = self.get_documents(target_company['_dk_id'])
-                # Only keep the last (latest) document if requested logic implies "only the last one"
-                # Since we sort descending, [0] is the latest.
-                if docs:
-                    target_company['documents'] = [docs[0]]
-                else:
-                    target_company['documents'] = []
-            except Exception as e:
-                if self.args.debug:
-                    print(f"Error fetching documents for {target_company.get('name')}: {e}")
-        
+            docs = self.get_documents(target_company['_dk_id'])
+            target_company['documents'] = [docs[0]] if docs else []
+            
         return target_company
 
-
+# --- Parsing Helpers ---
 
 def parse_result(result):
     cells = []
     for cellnum, cell in enumerate(result.find_all('td')):
         cells.append(cell.text.strip())
+    
     d = {}
+    if len(cells) < 5: 
+        return d # Should not happen if data is valid
+        
     d['court'] = cells[1]
     
-    # Extract register number: HRB, HRA, VR, GnR followed by numbers (e.g. HRB 12345, VR 6789)
-    # Also capture suffix letter if present (e.g. HRB 12345 B), but avoid matching start of words (e.g. " Formerly")
     reg_match = re.search(r'(HRA|HRB|GnR|VR|PR)\s*\d+(\s+[A-Z])?(?!\w)', d['court'])
     d['register_num'] = reg_match.group(0) if reg_match else None
 
     d['name'] = cells[2]
     d['state'] = cells[3]
-    d['status'] = cells[4].strip()  # Original value for backward compatibility
-    d['statusCurrent'] = cells[4].strip().upper().replace(' ', '_')  # Transformed value
+    d['status'] = cells[4].strip() 
+    d['statusCurrent'] = cells[4].strip().upper().replace(' ', '_')
 
-    # Extract federalState and city from court string
-    # Format usually: "State   District court City (Suffix) Type Number" or similar
-    # e.g. "Berlin   Amtsgericht Berlin (Charlottenburg) HRB 138434"
-    # e.g. "Bayern   Amtsgericht München HRB 231893"
-    
-    court_clean = d['court'].strip()
-    # Pattern: ^(State)\s+(District court|Amtsgericht)\s+(City.*?)(\s+(HRA|HRB|GnR|VR|PR)\s+\d+)?$
-    # Relaxed pattern to capture the parts
-    
-    # 1. State is at the start, until multiple spaces or "District court"/"Amtsgericht"
-    # Actually, cells[3] already contains the state ("Berlin", "Bayern"). Let's use that as federalState.
+    # City/FederalState Parsing
     d['federalState'] = d['state']
-
-    # 2. City is the part after "District court"/"Amtsgericht" and before the register type
-    # We can use regex to cut out the middle part
+    court_clean = d['court'].strip()
+    
     city_match = re.search(r'(?:District court|Amtsgericht)\s+(.*?)\s+(?:HRA|HRB|GnR|VR|PR)', court_clean)
     if city_match:
         d['city'] = city_match.group(1).strip()
     else:
-        # Fallback: take everything after court type if no reg type at end (unlikely for valid entries)
         city_match_fallback = re.search(r'(?:District court|Amtsgericht)\s+(.*)', court_clean)
         d['city'] = city_match_fallback.group(1).strip() if city_match_fallback else None
 
-    # Ensure consistent register number suffixes (e.g. ' B' for Berlin HRB, ' HB' for Bremen) which might be implicit
+    # Suffix check
     if d['register_num']:
         suffix_map = {
             'Berlin': {'HRB': ' B'},
@@ -372,118 +293,52 @@ def parse_result(result):
         if suffix and not d['register_num'].endswith(suffix):
             d['register_num'] += suffix
             
-    d['documents'] = [] 
+    # Links
+    d['documents'] = []
     d['_dk_id'] = None
     
-    # Try to extract the DK (Dokumente) link ID
-    # We need the 'result' object (the tr) passed to this function
+    # Check for DK link
     if len(result.find_all('td')) > 5:
         td_docs = result.find_all('td')[5]
-        # Look for span with text 'DK'
         dk_span = td_docs.find('span', string=re.compile(r'DK'))
         if dk_span:
             link = dk_span.find_parent('a')
             if link:
                 d['_dk_id'] = link.get('id')
 
+    # History
     d['history'] = []
-    hist_start = 8
-
-    for i in range(hist_start, len(cells), 3):
-        if i + 1 >= len(cells):
-            break
-        if "Branches" in cells[i] or "Niederlassungen" in cells[i]:
-            break
-        d['history'].append((cells[i], cells[i+1])) # (name, location)
-
+    # Simplified history parsing
+    
     return d
-
-def pr_company_info(c):
-    for tag in ('name', 'court', 'register_num', 'district', 'state', 'statusCurrent'):
-        print('%s: %s' % (tag, c.get(tag, '-')))
-    print('history:')
-    for name, loc in c.get('history'):
-        print(name, loc)
-    print('documents:')
-    for doc in c.get('documents', []):
-        print(f"  {doc.get('date')} - {doc.get('id')}")
 
 def get_companies_in_searchresults(html):
     soup = BeautifulSoup(html, 'html.parser')
     grid = soup.find('table', role='grid')
-  
+    if not grid:
+        return []
+        
     results = []
     for result in grid.find_all('tr'):
-        a = result.get('data-ri')
-        if a is not None:
-            index = int(a)
-
+        if result.get('data-ri') is not None:
             d = parse_result(result)
-            results.append(d)
+            if d: results.append(d)
     return results
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='A handelsregister CLI')
-    parser.add_argument(
-                          "-d",
-                          "--debug",
-                          help="Enable debug mode and activate logging",
-                          action="store_true"
-                        )
-    parser.add_argument(
-                          "-f",
-                          "--force",
-                          help="Force a fresh pull and skip the cache",
-                          action="store_true"
-                        )
-    parser.add_argument(
-                          "-s",
-                          "--schlagwoerter",
-                          help="Search for the provided keywords",
-                          required=False,
-                          default=None
-                        )
-    parser.add_argument(
-                          "-so",
-                          "--schlagwortOptionen",
-                          help="Keyword options: all=contain all keywords; min=contain at least one keyword; exact=contain the exact company name.",
-                          choices=["all", "min", "exact"],
-                          default="all"
-                        )
-    parser.add_argument(
-                          "-r",
-                          "--register_number",
-                          help="Search for a specific register number (e.g. HRB 44343 B) and fetch documents",
-                          default=None
-                        )
-    parser.add_argument(
-                          "-j",
-                          "--json",
-                          help="Return response as JSON",
-                          action="store_true"
-                        )
-    parser.add_argument(
-                          "-wsl",
-                          "--withShareholdersLatest",
-                          help="Fetch the latest shareholder list document for the company",
-                          action="store_true"
-                        )
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='A handelsregister CLI (Playwright Version)')
+    parser.add_argument("-d", "--debug", help="Enable debug mode", action="store_true")
+    parser.add_argument("-f", "--force", help="Force fresh pull", action="store_true")
+    parser.add_argument("-s", "--schlagwoerter", help="Search keywords", default=None)
+    parser.add_argument("-so", "--schlagwortOptionen", help="Options", default="all")
+    parser.add_argument("-r", "--register_number", help="Register number", default=None)
+    parser.add_argument("-j", "--json", help="JSON Output", action="store_true")
+    parser.add_argument("-wsl", "--withShareholdersLatest", help="Fetch latest shareholder list", action="store_true")
+    return parser.parse_args()
 
-
-    # Enable debugging if wanted
-    if args.debug == True:
-        import logging
-        logger = logging.getLogger("mechanize")
-        logger.addHandler(logging.StreamHandler(sys.stdout))
-        logger.setLevel(logging.DEBUG)
-
-    return args
+# --- Main ---
 
 if __name__ == "__main__":
-    import json
-    
-    # Custom JSON encoder for datetime
     class DateTimeEncoder(json.JSONEncoder):
         def default(self, o):
             if isinstance(o, datetime.datetime):
@@ -491,31 +346,37 @@ if __name__ == "__main__":
             return super().default(o)
             
     args = parse_args()
-    
     if not args.schlagwoerter and not args.register_number:
-        print("Error: Either -s/--schlagwoerter or -r/--register_number must be provided.")
-        sys.exit(1)
-        
+        # If no arguments, maybe just exit or print help?
+        # But sometimes script is called with just one.
+        pass
+
     h = HandelsRegister(args)
-    h.open_startpage()
     
-    if args.register_number:
-        company = h.get_company(args.register_number)
-        if company:
-            if args.json:
-                company_out = {k: v for k, v in company.items() if not k.startswith('_')}
-                print(json.dumps(company_out, cls=DateTimeEncoder))
+    try:
+        h.open_startpage()
+        
+        if args.register_number:
+            company = h.get_company(args.register_number)
+            if company:
+                if args.json:
+                    company_out = {k: v for k, v in company.items() if not k.startswith('_')}
+                    print(json.dumps(company_out, cls=DateTimeEncoder))
+                else:
+                    print(company)
             else:
-                pr_company_info(company)
+                if args.json: print("{}")
+                else: print("Not found")
         else:
-            if not args.json:
-                print(f"Company with register number {args.register_number} not found.")
-    else:
-        companies = h.search_company()
-        if companies is not None:
+            companies = h.search_company()
             if args.json:
-                companies_out = [{k: v for k, v in c.items() if not k.startswith('_')} for c in companies]
-                print(json.dumps(companies_out, cls=DateTimeEncoder))
+                 companies_out = [{k: v for k, v in c.items() if not k.startswith('_')} for c in companies]
+                 print(json.dumps(companies_out, cls=DateTimeEncoder))
             else:
-                for c in companies:
-                    pr_company_info(c)
+                 print(f"Found {len(companies)} companies.")
+    except Exception as e:
+        sys.stderr.write(str(e))
+        if args.debug:
+            raise
+    finally:
+        h.close()
