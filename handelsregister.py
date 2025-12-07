@@ -481,7 +481,8 @@ if __name__ == "__main__":
         company = h.get_company(args.register_number)
         if company:
             if args.json:
-                print(json.dumps(company, cls=DateTimeEncoder))
+                company_out = {k: v for k, v in company.items() if not k.startswith('_')}
+                print(json.dumps(company_out, cls=DateTimeEncoder))
             else:
                 pr_company_info(company)
         else:
@@ -491,7 +492,8 @@ if __name__ == "__main__":
         companies = h.search_company()
         if companies is not None:
             if args.json:
-                print(json.dumps(companies, cls=DateTimeEncoder))
+                companies_out = [{k: v for k, v in c.items() if not k.startswith('_')} for c in companies]
+                print(json.dumps(companies_out, cls=DateTimeEncoder))
             else:
                 for c in companies:
                     pr_company_info(c)
