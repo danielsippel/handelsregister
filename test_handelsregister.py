@@ -12,7 +12,8 @@ def test_parse_search_result():
             'state':'Berlin',
             'status':'currently registered',  # Original value for backward compatibility
             'statusCurrent':'CURRENTLY_REGISTERED',  # Transformed value
-            'documents': 'ADCDHDDKUTVÖSI',
+            'documents': [],
+            '_dk_id': 'ergebnissForm:selectedSuchErgebnisFormTable:0:j_idt161:3:fade',
             'history':[('1.) Gasag Berliner Gaswerke Aktiengesellschaft', '1.) Berlin')]
             },]
 
@@ -37,7 +38,7 @@ def test_parse_search_result():
 ])
 def test_search_by_state_company(company, state_id):
 
-    args = argparse.Namespace(debug=False, force=True, schlagwoerter=company, schlagwortOptionen='all', json=False)
+    args = argparse.Namespace(debug=False, force=True, schlagwoerter=company, schlagwortOptionen='all', json=False, register_number=None)
     h = HandelsRegister(args)
     h.open_startpage()
     companies = h.search_company()
@@ -45,7 +46,7 @@ def test_search_by_state_company(company, state_id):
     assert len(companies) > 0
 
 def test_haus_anker_b_suffix():
-    args = argparse.Namespace(debug=False, force=True, schlagwoerter='Haus-Anker Verwaltungs GmbH', schlagwortOptionen='exact', json=False)
+    args = argparse.Namespace(debug=False, force=True, schlagwoerter='Haus-Anker Verwaltungs GmbH', schlagwortOptionen='exact', json=False, register_number=None)
     h = HandelsRegister(args)
     h.open_startpage()
     companies = h.search_company()

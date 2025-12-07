@@ -12,6 +12,7 @@ import pathlib
 import sys
 from bs4 import BeautifulSoup
 import urllib.parse
+import datetime
 
 # Dictionaries to map arguments to values
 schlagwortOptionen = {
@@ -39,15 +40,19 @@ class HandelsRegister:
         self.browser.addheaders = [
             (
                 "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             ),
-            (   "Accept-Language", "en-GB,en;q=0.9"   ),
+            (   "Accept-Language", "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"   ),
             (   "Accept-Encoding", "gzip, deflate, br"    ),
             (
                 "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             ),
             (   "Connection", "keep-alive"    ),
+            (   "Sec-Fetch-Dest", "document" ),
+            (   "Sec-Fetch-Mode", "navigate" ),
+            (   "Sec-Fetch-Site", "same-origin" ),
+            (   "Upgrade-Insecure-Requests", "1" ),
         ]
         
         self.cachedir = pathlib.Path(tempfile.gettempdir()) / "handelsregister_cache"
@@ -78,10 +83,28 @@ class HandelsRegister:
                 print(self.browser.title())
 
             self.browser.select_form(name="form")
-
-            self.browser["form:schlagwoerter"] = self.args.schlagwoerter
+            
+            # Use register number fields if available and parseable
+            reg_parsed = False
+            if self.args.register_number:
+                match = re.search(r'(HRA|HRB|GnR|VR|PR)\s*(\d+)', self.args.register_number)
+                if match:
+                    reg_type = match.group(1)
+                    reg_num = match.group(2)
+                    try:
+                        self.browser["form:registerArt_input"] = [reg_type]
+                        self.browser["form:registerNummer"] = reg_num
+                        self.browser["form:schlagwoerter"] = ""
+                        reg_parsed = True
+                    except Exception as e:
+                        if self.args.debug:
+                            print(f"Failed to set register number fields: {e}")
+            
+            if not reg_parsed:
+                # Fallback to keywords
+                 self.browser["form:schlagwoerter"] = self.args.schlagwoerter
+                 
             so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
-
             self.browser["form:schlagwortOptionen"] = [str(so_id)]
 
             response_result = self.browser.submit()
@@ -96,7 +119,206 @@ class HandelsRegister:
             # TODO catch the situation if there's more than one company?
             # TODO get all documents attached to the exact company
             # TODO parse useful information out of the PDFs
-        return get_companies_in_searchresults(html)
+        
+        companies = get_companies_in_searchresults(html)
+        return companies
+
+    def get_documents(self, dk_id):
+        self.browser.select_form(name="ergebnissForm")
+        self.browser.form.new_control('hidden', 'javax.faces.source', {'value': dk_id})
+        # Try full postback instead of partial AJAX to avoid complex state issues and get full page
+        # self.browser.form.new_control('hidden', 'javax.faces.partial.event', {'value': 'click'})
+        # self.browser.form.new_control('hidden', 'javax.faces.partial.execute', {'value': '@component'})
+        # self.browser.form.new_control('hidden', 'javax.faces.partial.render', {'value': '@component'})
+        self.browser.form.new_control('hidden', dk_id, {'value': dk_id})
+        
+        # Determine current ViewState if possible, mechanize usually handles it if we selected form
+        # But we added controls, so it should be fine.
+        
+        try:
+            response = self.browser.submit()
+            content = response.read().decode('utf-8')
+            return self.parse_documents(content)
+        finally:
+             # We might be on a different page now (documents page), so back might be needed 
+             # to return to search results for next iteration.
+             # If submission failed or redirected, history tracking in mechanize handles it.
+            try:
+                self.browser.back()
+            except Exception as e:
+                if self.args.debug:
+                    print(f"Error going back: {e}")
+
+    def parse_documents(self, html):
+        if "session has expired" in html.lower() or "sitzung abgelaufen" in html.lower():
+            print("[WARN] Session expired while fetching documents. Use a browser to download.")
+            return []
+
+        soup = BeautifulSoup(html, 'html.parser')
+        docs = []
+        
+        # Strategy: Look for all text nodes that look like dates, then find nearby links or context
+        # The tree structure usually puts the document name (with date) in a span/label
+        
+        # Regex for date: dd.mm.yyyy
+        date_pattern = re.compile(r'(\d{2}\.\d{2}\.\d{4})')
+        
+        # Broad search for any element containing a date
+        # We limit to likely containers
+        elements_with_dates = soup.find_all(string=date_pattern)
+        
+        for text_node in elements_with_dates:
+            date_match = date_pattern.search(text_node)
+            if not date_match:
+                continue
+            
+            date_str = date_match.group(1)
+            doc_date = None
+            try:
+                doc_date = datetime.datetime.strptime(date_str, "%d.%m.%Y")
+            except:
+                continue
+                
+            # Now try to find a link nearby.
+            # In a tree, the link might be the element itself or a parent/sibling
+            # Or the 'Download' button is separate.
+            # If we can't find a direct download link, we might at least identify the document existence.
+            # Currently we need 'pdf' link.
+            
+            # Use a placeholder link if we can't find it, or look harder.
+            # Usually the tree node is click-able (commandLink).
+            
+            # Let's check parent 'a' tag
+            node_parent = text_node.parent
+            link = node_parent.find_parent('a') if node_parent else None
+            
+            if not link and node_parent:
+                # Sibling?
+                pass
+            
+            # Heuristic: If we found a date, it's likely a document record.
+            # If we can't find a real PDF link (because it requires another click),
+            # we can store a "virtual" link or similar specific ID.
+            
+            # For now, let's assume if it is inside an 'a' tag or clickable, we take it.
+            # If no link, we skip for now (or store as 'No Link')
+            
+            pdf_link = link['href'] if link and 'href' in link.attrs else None
+            # If link is '#' it is likely a JSF action -> not a direct PDF.
+            if pdf_link == '#':
+                pdf_link = link.get('id') # Store ID to indicate it's interactable
+            
+            docs.append({
+                 'id': pdf_link or "unknown", 
+                 'pdf': pdf_link, # Might be None
+                 'date': doc_date,
+                 'name': text_node.strip()
+             })
+
+        # Fallback: Table parsing (original logic) if above yielded nothing or mixed
+        if not docs:
+            tables = soup.find_all('table', role='grid')
+            for table in tables:
+                rows = table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) < 3:
+                         continue
+                    
+                    date_str = None
+                    doc_date = None
+                    
+                    for cell in cells:
+                        text = cell.text.strip()
+                        match = date_pattern.search(text)
+                        if match:
+                            date_str = match.group(0)
+                            try:
+                                doc_date = datetime.datetime.strptime(date_str, "%d.%m.%Y")
+                            except:
+                                pass
+                            break
+                    
+                    if not doc_date:
+                        continue
+                        
+                    pdf_link = None
+                    for cell in cells:
+                        link = cell.find('a')
+                        if link and ('href' in link.attrs):
+                            pdf_link = link['href'] 
+                            break
+                    
+                    if pdf_link:
+                         docs.append({
+                             'id': pdf_link, 
+                             'pdf': pdf_link,
+                             'date': doc_date
+                         })
+
+        # Deduplicate by date + id
+        unique_docs = {}
+        for d in docs:
+            key = f"{d['date']}_{d['id']}"
+            unique_docs[key] = d
+        
+        sorted_docs = sorted(unique_docs.values(), key=lambda x: x['date'], reverse=True)
+        return sorted_docs
+
+    def get_company(self, register_num):
+        """
+        Fetch a specific company by its register number and retrieve its documents.
+        """
+        # The register number often works as a search term
+        # But picking specific fields is better.
+        # We set self.args.register_number to ensure search_company uses the specific fields if possible.
+        self.args.register_number = register_num
+        self.args.schlagwoerter = register_num # Fallback if parsing fails
+        
+        companies = self.search_company()
+        if self.args.debug:
+            print(f"Found {len(companies)} companies. Searching match for '{register_num}'...")
+            for c in companies:
+                print(f" - {c.get('name')} ({c.get('register_num')})")
+        
+        target_company = None
+        # 1. Try exact match
+        for c in companies:
+             if c.get('register_num') == register_num:
+                 target_company = c
+                 break
+        
+        # 2. Try normalized match (ignore spaces)
+        if not target_company:
+             clean_reg = register_num.replace(' ', '')
+             for c in companies:
+                 if c.get('register_num', '').replace(' ', '') == clean_reg:
+                     target_company = c
+                     break
+        
+        # 3. Try containment (if input is "HRB 12345" and result is "HRB 12345 B")
+        # Only if we don't have an exact match
+        if not target_company:
+            for c in companies:
+                # Check if result starts with the input (assuming input is the prefix part)
+                if c.get('register_num', '').startswith(register_num):
+                    target_company = c
+                    break
+
+        if self.args.withShareholdersLatest and target_company and target_company.get('_dk_id'):
+            try:
+                docs = self.get_documents(target_company['_dk_id'])
+                # Only keep the last (latest) document if requested logic implies "only the last one"
+                # Since we sort descending, [0] is the latest.
+                if docs:
+                    target_company['documents'] = [docs[0]]
+                else:
+                    target_company['documents'] = []
+            except Exception as e:
+                if self.args.debug:
+                    print(f"Error fetching documents for {target_company.get('name')}: {e}")
+        
+        return target_company
 
 
 
@@ -127,7 +349,21 @@ def parse_result(result):
         suffix = suffix_map.get(d['state'], {}).get(reg_type)
         if suffix and not d['register_num'].endswith(suffix):
             d['register_num'] += suffix
-    d['documents'] = cells[5] # todo: get the document links
+            
+    d['documents'] = [] 
+    d['_dk_id'] = None
+    
+    # Try to extract the DK (Dokumente) link ID
+    # We need the 'result' object (the tr) passed to this function
+    if len(result.find_all('td')) > 5:
+        td_docs = result.find_all('td')[5]
+        # Look for span with text 'DK'
+        dk_span = td_docs.find('span', string=re.compile(r'DK'))
+        if dk_span:
+            link = dk_span.find_parent('a')
+            if link:
+                d['_dk_id'] = link.get('id')
+
     d['history'] = []
     hist_start = 8
 
@@ -146,6 +382,9 @@ def pr_company_info(c):
     print('history:')
     for name, loc in c.get('history'):
         print(name, loc)
+    print('documents:')
+    for doc in c.get('documents', []):
+        print(f"  {doc.get('date')} - {doc.get('id')}")
 
 def get_companies_in_searchresults(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -179,8 +418,8 @@ def parse_args():
                           "-s",
                           "--schlagwoerter",
                           help="Search for the provided keywords",
-                          required=True,
-                          default="Gasag AG" # TODO replace default with a generic search term
+                          required=False,
+                          default=None
                         )
     parser.add_argument(
                           "-so",
@@ -190,9 +429,21 @@ def parse_args():
                           default="all"
                         )
     parser.add_argument(
+                          "-r",
+                          "--register_number",
+                          help="Search for a specific register number (e.g. HRB 44343 B) and fetch documents",
+                          default=None
+                        )
+    parser.add_argument(
                           "-j",
                           "--json",
                           help="Return response as JSON",
+                          action="store_true"
+                        )
+    parser.add_argument(
+                          "-wsl",
+                          "--withShareholdersLatest",
+                          help="Fetch the latest shareholder list document for the company",
                           action="store_true"
                         )
     args = parser.parse_args()
@@ -209,13 +460,38 @@ def parse_args():
 
 if __name__ == "__main__":
     import json
+    
+    # Custom JSON encoder for datetime
+    class DateTimeEncoder(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, datetime.datetime):
+                return o.isoformat()
+            return super().default(o)
+            
     args = parse_args()
+    
+    if not args.schlagwoerter and not args.register_number:
+        print("Error: Either -s/--schlagwoerter or -r/--register_number must be provided.")
+        sys.exit(1)
+        
     h = HandelsRegister(args)
     h.open_startpage()
-    companies = h.search_company()
-    if companies is not None:
-        if args.json:
-            print(json.dumps(companies))
+    
+    if args.register_number:
+        company = h.get_company(args.register_number)
+        if company:
+            if args.json:
+                print(json.dumps(company, cls=DateTimeEncoder))
+            else:
+                pr_company_info(company)
         else:
-            for c in companies:
-                pr_company_info(c)
+            if not args.json:
+                print(f"Company with register number {args.register_number} not found.")
+    else:
+        companies = h.search_company()
+        if companies is not None:
+            if args.json:
+                print(json.dumps(companies, cls=DateTimeEncoder))
+            else:
+                for c in companies:
+                    pr_company_info(c)
