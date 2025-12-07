@@ -339,6 +339,29 @@ def parse_result(result):
     d['status'] = cells[4].strip()  # Original value for backward compatibility
     d['statusCurrent'] = cells[4].strip().upper().replace(' ', '_')  # Transformed value
 
+    # Extract federalState and city from court string
+    # Format usually: "State   District court City (Suffix) Type Number" or similar
+    # e.g. "Berlin   Amtsgericht Berlin (Charlottenburg) HRB 138434"
+    # e.g. "Bayern   Amtsgericht München HRB 231893"
+    
+    court_clean = d['court'].strip()
+    # Pattern: ^(State)\s+(District court|Amtsgericht)\s+(City.*?)(\s+(HRA|HRB|GnR|VR|PR)\s+\d+)?$
+    # Relaxed pattern to capture the parts
+    
+    # 1. State is at the start, until multiple spaces or "District court"/"Amtsgericht"
+    # Actually, cells[3] already contains the state ("Berlin", "Bayern"). Let's use that as federalState.
+    d['federalState'] = d['state']
+
+    # 2. City is the part after "District court"/"Amtsgericht" and before the register type
+    # We can use regex to cut out the middle part
+    city_match = re.search(r'(?:District court|Amtsgericht)\s+(.*?)\s+(?:HRA|HRB|GnR|VR|PR)', court_clean)
+    if city_match:
+        d['city'] = city_match.group(1).strip()
+    else:
+        # Fallback: take everything after court type if no reg type at end (unlikely for valid entries)
+        city_match_fallback = re.search(r'(?:District court|Amtsgericht)\s+(.*)', court_clean)
+        d['city'] = city_match_fallback.group(1).strip() if city_match_fallback else None
+
     # Ensure consistent register number suffixes (e.g. ' B' for Berlin HRB, ' HB' for Bremen) which might be implicit
     if d['register_num']:
         suffix_map = {
