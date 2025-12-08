@@ -576,19 +576,29 @@ class HandelsRegister:
 
     def get_company(self, register_num, company_name=None):
         """
-        Fetch a specific company by its register number and retrieve its documents.
+        Fetch a specific company by its register number (and optionally company name) and retrieve its documents.
+        NOTE: register_number is NOT unique! Use company_name for more reliable identification.
         If company_name is provided, it is used to disambiguate between multiple companies
         with the same register number at different courts.
         """
-        # The register number often works as a search term
-        # But picking specific fields is better.
-        # We set self.args.register_number to ensure search_company uses the specific fields if possible.
-        self.args.register_number = register_num
-        self.args.schlagwoerter = register_num # Fallback if parsing fails
+        # If company_name is provided, use it for search (more reliable)
+        # Then filter results by register_number
+        if company_name:
+            if self.args.debug:
+                print(f"Searching for company '{company_name}' with register number '{register_num}'...")
+            self.args.schlagwoerter = company_name
+            # Don't set register_number in args to avoid using it in search form fields
+            # We'll filter manually below
+        else:
+            # Fallback: use register number for search
+            if self.args.debug:
+                print(f"Warning: Searching by register_number only (not unique!). Consider providing company_name.")
+            self.args.register_number = register_num
+            self.args.schlagwoerter = register_num
         
         companies = self.search_company()
         if self.args.debug:
-            print(f"Found {len(companies)} companies. Searching match for '{register_num}'...")
+            print(f"Found {len(companies)} companies in search results...")
             for c in companies:
                 print(f" - {c.get('name')} ({c.get('register_num')})")
         
@@ -619,28 +629,53 @@ class HandelsRegister:
                     print(f"Warning: No companies found matching name '{company_name}'")
         
         target_company = None
-        # 1. Try exact match
+        
+        # Filter by register_number
+        matches_by_register = []
+        clean_reg = register_num.replace(' ', '')
+        
         for c in companies:
-             if c.get('register_num') == register_num:
-                 target_company = c
-                 break
+            c_reg = c.get('register_num', '')
+            # Try exact match
+            if c_reg == register_num:
+                matches_by_register.append(c)
+            # Try normalized match (ignore spaces)
+            elif c_reg.replace(' ', '') == clean_reg:
+                matches_by_register.append(c)
+            # Try containment (if input is "HRB 12345" and result is "HRB 12345 B")
+            elif c_reg.startswith(register_num):
+                matches_by_register.append(c)
         
-        # 2. Try normalized match (ignore spaces)
-        if not target_company:
-             clean_reg = register_num.replace(' ', '')
-             for c in companies:
-                 if c.get('register_num', '').replace(' ', '') == clean_reg:
-                     target_company = c
-                     break
+        if self.args.debug:
+            print(f"Found {len(matches_by_register)} companies matching register_number filter")
         
-        # 3. Try containment (if input is "HRB 12345" and result is "HRB 12345 B")
-        # Only if we don't have an exact match
-        if not target_company:
-            for c in companies:
-                # Check if result starts with the input (assuming input is the prefix part)
-                if c.get('register_num', '').startswith(register_num):
-                    target_company = c
-                    break
+        # If we have company_name, filter further by name similarity
+        if company_name and matches_by_register:
+            if len(matches_by_register) == 1:
+                target_company = matches_by_register[0]
+                if self.args.debug:
+                    print(f"Single match found: {target_company.get('name')}")
+            else:
+                # Multiple matches - use company name to disambiguate
+                clean_name = company_name.lower().strip()
+                for c in matches_by_register:
+                    c_name = c.get('name', '').lower().strip()
+                    if clean_name in c_name or c_name in clean_name:
+                        target_company = c
+                        if self.args.debug:
+                            print(f"Matched by company name: {c.get('name')}")
+                        break
+                
+                if not target_company:
+                    # No name match - take first match and warn
+                    target_company = matches_by_register[0]
+                    if self.args.debug:
+                        print(f"Warning: Multiple matches, using first: {target_company.get('name')}")
+        elif matches_by_register:
+            # No company_name provided, just take first match by register_number
+            target_company = matches_by_register[0]
+            if len(matches_by_register) > 1 and self.args.debug:
+                print(f"Warning: Multiple companies with register_number '{register_num}'. Using first match.")
 
         if target_company and target_company.get('_dk_id'):
             if self.args.debug:
@@ -876,6 +911,7 @@ if __name__ == "__main__":
             if not args.json:
                 print(f"Company with register number {args.register_number} not found.")
     else:
+        # Only company name/keywords provided - do search
         companies = h.search_company()
         if companies is not None:
             if args.json:
