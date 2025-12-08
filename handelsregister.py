@@ -107,6 +107,11 @@ class HandelsRegister:
             so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
             self.browser["form:schlagwortOptionen"] = [str(so_id)]
 
+            try:
+                self.browser["form:ergebnisseProSeite_input"] = ["100"]
+            except Exception:
+                pass
+
             response_result = self.browser.submit()
 
             if self.args.debug == True:
