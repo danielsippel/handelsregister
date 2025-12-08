@@ -656,7 +656,7 @@ class HandelsRegister:
         clean_reg = register_num.replace(' ', '')
         
         for c in companies:
-            c_reg = c.get('register_num', '')
+            c_reg = c.get('register_num') or ''
             # Try exact match
             if c_reg == register_num:
                 matches_by_register.append(c)
