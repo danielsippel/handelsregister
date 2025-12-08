@@ -259,7 +259,8 @@ poetry run python -m pytest
 Das CLI ist _work in progress_ und 
 
 ```
-usage: handelsregister.py [-h] [-d] [-f] -s SCHLAGWOERTER [-so {all,min,exact}]
+usage: handelsregister.py [-h] [-d] [-f] [-s SCHLAGWOERTER] [-so {all,min,exact}] 
+                          [-r REGISTER_NUMBER] [-cn COMPANY_NAME] [-j] [-wsl]
 
 A handelsregister CLI
 
@@ -272,4 +273,28 @@ options:
   -so {all,min,exact}, --schlagwortOptionen {all,min,exact}
                         Keyword options: all=contain all keywords; min=contain at least one
                         keyword; exact=contain the exact company name.
+  -r REGISTER_NUMBER, --register_number REGISTER_NUMBER
+                        Search for a specific register number (e.g. HRB 44343 B) and fetch 
+                        documents. Must be used together with --company_name.
+  -cn COMPANY_NAME, --company_name COMPANY_NAME
+                        Company name to disambiguate between multiple companies with the same 
+                        register number. Required when using --register_number.
+  -j, --json            Return response as JSON
+  -wsl, --withShareholdersLatest
+                        Fetch the latest shareholder list document for the company
+```
+
+**Wichtig:** Die Registernummer (z.B. HRB 8391) ist **keine eindeutige ID**. Jedes Amtsgericht 
+beginnt bei 1 zu zählen, daher existiert dieselbe Nummer bei verschiedenen Gerichten. Der 
+"Primary Key" für eine Firma ist die Kombination aus:
+- Registergericht (z.B. Amtsgericht Frankfurt am Main)
+- Registerart (HRB für Kapitalgesellschaften, HRA für Personengesellschaften, VR für Vereine)
+- Registernummer (z.B. 8391)
+
+Aus diesem Grund **muss** bei Verwendung von `--register_number` auch `--company_name` angegeben 
+werden, um die korrekte Firma eindeutig zu identifizieren.
+
+**Beispiel:**
+```bash
+poetry run python handelsregister.py -r "HRB 8391" -cn "Heluma GmbH" -j
 ```

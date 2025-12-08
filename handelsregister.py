@@ -574,9 +574,11 @@ class HandelsRegister:
                  print(f"Error downloading via rowkey: {e}")
             return None
 
-    def get_company(self, register_num):
+    def get_company(self, register_num, company_name=None):
         """
         Fetch a specific company by its register number and retrieve its documents.
+        If company_name is provided, it is used to disambiguate between multiple companies
+        with the same register number at different courts.
         """
         # The register number often works as a search term
         # But picking specific fields is better.
@@ -589,6 +591,32 @@ class HandelsRegister:
             print(f"Found {len(companies)} companies. Searching match for '{register_num}'...")
             for c in companies:
                 print(f" - {c.get('name')} ({c.get('register_num')})")
+        
+        # If company_name is provided, filter by name first
+        if company_name:
+            if self.args.debug:
+                print(f"Filtering by company name: '{company_name}'")
+            
+            # Try exact match first (case-sensitive)
+            name_filtered = [c for c in companies if c.get('name') == company_name]
+            
+            # If no exact match, try case-insensitive
+            if not name_filtered:
+                company_name_lower = company_name.lower()
+                name_filtered = [c for c in companies if c.get('name', '').lower() == company_name_lower]
+            
+            # If still no match, try substring match
+            if not name_filtered:
+                company_name_lower = company_name.lower()
+                name_filtered = [c for c in companies if company_name_lower in c.get('name', '').lower()]
+            
+            if name_filtered:
+                companies = name_filtered
+                if self.args.debug:
+                    print(f"After name filtering: {len(companies)} companies remaining")
+            else:
+                if self.args.debug:
+                    print(f"Warning: No companies found matching name '{company_name}'")
         
         target_company = None
         # 1. Try exact match
@@ -777,7 +805,13 @@ def parse_args():
     parser.add_argument(
                           "-r",
                           "--register_number",
-                          help="Search for a specific register number (e.g. HRB 44343 B) and fetch documents",
+                          help="Search for a specific register number (e.g. HRB 44343 B) and fetch documents. Must be used together with --company_name.",
+                          default=None
+                        )
+    parser.add_argument(
+                          "-cn",
+                          "--company_name",
+                          help="Company name to disambiguate between multiple companies with the same register number. Required when using --register_number.",
                           default=None
                         )
     parser.add_argument(
@@ -819,12 +853,19 @@ if __name__ == "__main__":
     if not args.schlagwoerter and not args.register_number:
         print("Error: Either -s/--schlagwoerter or -r/--register_number must be provided.")
         sys.exit(1)
+    
+    # Validate that company_name is provided when register_number is used
+    if args.register_number and not args.company_name:
+        print("Error: --company_name is required when using --register_number.")
+        print("Reason: Register numbers are not unique across different courts.")
+        print("Example: 'HRB 8391' exists at multiple courts in Hessen.")
+        sys.exit(1)
         
     h = HandelsRegister(args)
     h.open_startpage()
     
     if args.register_number:
-        company = h.get_company(args.register_number)
+        company = h.get_company(args.register_number, args.company_name)
         if company:
             if args.json:
                 company_out = {k: v for k, v in company.items() if not k.startswith('_')}
