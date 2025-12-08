@@ -581,20 +581,36 @@ class HandelsRegister:
         If company_name is provided, it is used to disambiguate between multiple companies
         with the same register number at different courts.
         """
-        # If company_name is provided, use it for search (more reliable)
-        # Then filter results by register_number
+        # Strategy: Extract a core search term from company_name (if provided) to cast a wider net in search
+        # Then filter strictly by exact company_name + register_number
+        # This is necessary because:
+        # 1. Searching by full company name doesn't work well in Handelsregister
+        # 2. Searching by register_number alone returns only first page of results (might be 100+ companies)
+        # 3. We need a unique combination to find the right company
+        
+        search_term = None
         if company_name:
+            # Extract core search term (first significant word, usually the company's distinctive name)
+            # Remove common suffixes like "GmbH", "AG", etc.
+            import re
+            clean_name = re.sub(r'\s+(GmbH|AG|UG|KG|OHG|e\.V\.|eG|mbH|SE|Co\.|&|und)\s*', ' ', company_name, flags=re.IGNORECASE)
+            words = clean_name.strip().split()
+            # Use first word as core search term (usually the distinctive part)
+            search_term = words[0] if words else company_name
+            
             if self.args.debug:
-                print(f"Searching for company '{company_name}' with register number '{register_num}'...")
-            self.args.schlagwoerter = company_name
-            # Don't set register_number in args to avoid using it in search form fields
-            # We'll filter manually below
+                print(f"Searching for '{search_term}' (extracted from '{company_name}')")
+                print(f"Will filter by exact name '{company_name}' and register '{register_num}'...")
         else:
-            # Fallback: use register number for search
+            # Fallback: search by register number
+            search_term = register_num
             if self.args.debug:
                 print(f"Warning: Searching by register_number only (not unique!). Consider providing company_name.")
-            self.args.register_number = register_num
-            self.args.schlagwoerter = register_num
+        
+        # Use the search term for lookup
+        self.args.schlagwoerter = search_term
+        # Don't set register_number in args to avoid confusing the search
+        self.args.register_number = None
         
         companies = self.search_company()
         if self.args.debug:
