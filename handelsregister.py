@@ -107,10 +107,14 @@ class HandelsRegister:
             so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
             self.browser["form:schlagwortOptionen"] = [str(so_id)]
 
+            # Set results per page to 100
             try:
                 self.browser["form:ergebnisseProSeite_input"] = ["100"]
-            except Exception:
-                pass
+                # User requested to set the label as well, seemingly to ensure 100 results are returned
+                self.browser.form.new_control('hidden', 'form:ergebnisseProSeite_label', {'value': '100'})
+            except Exception as e:
+                if self.args.debug:
+                    print(f"Warning: Failed to set results per page options: {e}")
 
             response_result = self.browser.submit()
 
