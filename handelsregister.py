@@ -132,7 +132,22 @@ class HandelsRegister:
         return companies
 
     def get_documents(self, dk_id):
-        self.browser.select_form(name="ergebnissForm")
+        # Determine form name from dk_id prefix if possible, default to ergebnissForm
+        form_name = "ergebnissForm"
+        if dk_id and dk_id.startswith("form:"):
+             form_name = "form"
+        
+        try:
+            self.browser.select_form(name=form_name)
+        except:
+            # Fallback to the other one
+            fallback = "form" if form_name == "ergebnissForm" else "ergebnissForm"
+            try:
+                self.browser.select_form(name=fallback)
+            except:
+                 if self.args.debug:
+                      print(f"Debug: Could not find form {form_name} or {fallback}")
+                 return []
         self.browser.form.new_control('hidden', 'javax.faces.source', {'value': dk_id})
         # Try full postback instead of partial AJAX to avoid complex state issues and get full page
         # self.browser.form.new_control('hidden', 'javax.faces.partial.event', {'value': 'click'})
