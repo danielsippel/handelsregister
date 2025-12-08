@@ -16,8 +16,11 @@ import datetime
 import base64
 
 # Dictionaries to map arguments to values
-# Dictionaries to map arguments to values
-
+schlagwortOptionen = {
+    "all": 1,
+    "min": 2,
+    "exact": 3
+}
 
 class HandelsRegister:
     def __init__(self, args):
@@ -63,12 +66,12 @@ class HandelsRegister:
         return self.cachedir / companyname
 
     def search_company(self):
-        cachename = self.companyname2cachename(self.args.register_number + "_" + self.args.company_name)
+        cachename = self.companyname2cachename(self.args.schlagwoerter)
         if self.args.force==False and cachename.exists():
             with open(cachename, "r") as f:
                 html = f.read()
                 if not self.args.json:
-                    print(f"return cached content for {self.args.register_number} {self.args.company_name}")
+                    print("return cached content for %s" % self.args.schlagwoerter)
         else:
             # TODO implement token bucket to abide by rate limit
             # Use an atomic counter: https://gist.github.com/benhoyt/8c8a8d62debe8e5aa5340373f9c509c7
@@ -82,7 +85,8 @@ class HandelsRegister:
 
             self.browser.select_form(name="form")
             
-            # Use register number fields
+            # Use register number fields if available and parseable
+            reg_parsed = False
             if self.args.register_number:
                 match = re.search(r'(HRA|HRB|GnR|VR|PR)\s*(\d+)', self.args.register_number)
                 if match:
@@ -98,12 +102,10 @@ class HandelsRegister:
                             print(f"Failed to set register number fields: {e}")
             
             if not reg_parsed:
-                 # Should not happen if arguments are validated
-                 print("Error: Could not parse register number.", file=sys.stderr)
-                 return []
+                 self.browser["form:schlagwoerter"] = self.args.schlagwoerter
                  
-            # so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
-            # self.browser["form:schlagwortOptionen"] = [str(so_id)]
+            so_id = schlagwortOptionen.get(self.args.schlagwortOptionen)
+            self.browser["form:schlagwortOptionen"] = [str(so_id)]
 
             # Set results per page to 100
             try:
@@ -615,10 +617,9 @@ class HandelsRegister:
                 print(f"Warning: Searching by register_number only (not unique!). Consider providing company_name.")
         
         # Use the search term for lookup
-        # self.args.schlagwoerter = search_term # Removed
+        self.args.schlagwoerter = search_term
         # Don't set register_number in args to avoid confusing the search
-        # self.args.register_number = None # We need it now for search_company
-
+        self.args.register_number = None
         
         companies = self.search_company()
         if self.args.debug:
@@ -848,16 +849,30 @@ def parse_args():
                           action="store_true"
                         )
     parser.add_argument(
+                          "-s",
+                          "--schlagwoerter",
+                          help="Search for the provided keywords",
+                          required=False,
+                          default=None
+                        )
+    parser.add_argument(
+                          "-so",
+                          "--schlagwortOptionen",
+                          help="Keyword options: all=contain all keywords; min=contain at least one keyword; exact=contain the exact company name.",
+                          choices=["all", "min", "exact"],
+                          default="all"
+                        )
+    parser.add_argument(
                           "-r",
                           "--register_number",
-                          help="Search for a specific register number (e.g. HRB 44343 B). Required.",
-                          required=True
+                          help="Search for a specific register number (e.g. HRB 44343 B) and fetch documents. Must be used together with --company_name.",
+                          default=None
                         )
     parser.add_argument(
                           "-cn",
                           "--company_name",
-                          help="Company name to disambiguate between multiple companies with the same register number. Required.",
-                          required=True
+                          help="Company name to disambiguate between multiple companies with the same register number. Required when using --register_number.",
+                          default=None
                         )
     parser.add_argument(
                           "-j",
@@ -895,20 +910,38 @@ if __name__ == "__main__":
             
     args = parse_args()
     
-    if not args.register_number:
-         print("Error: -r/--register_number is required.")
-         sys.exit(1)
-
+    if not args.schlagwoerter and not args.register_number:
+        print("Error: Either -s/--schlagwoerter or -r/--register_number must be provided.")
+        sys.exit(1)
+    
+    # Validate that company_name is provided when register_number is used
+    if args.register_number and not args.company_name:
+        print("Error: --company_name is required when using --register_number.")
+        print("Reason: Register numbers are not unique across different courts.")
+        print("Example: 'HRB 8391' exists at multiple courts in Hessen.")
+        sys.exit(1)
+        
     h = HandelsRegister(args)
     h.open_startpage()
     
-    company = h.get_company(args.register_number, args.company_name)
-    if company:
-        if args.json:
-            company_out = {k: v for k, v in company.items() if not k.startswith('_')}
-            print(json.dumps(company_out, cls=DateTimeEncoder))
+    if args.register_number:
+        company = h.get_company(args.register_number, args.company_name)
+        if company:
+            if args.json:
+                company_out = {k: v for k, v in company.items() if not k.startswith('_')}
+                print(json.dumps(company_out, cls=DateTimeEncoder))
+            else:
+                pr_company_info(company)
         else:
-            pr_company_info(company)
+            if not args.json:
+                print(f"Company with register number {args.register_number} not found.")
     else:
-        if not args.json:
-            print(f"Company with register number {args.register_number} not found.")
+        # Only company name/keywords provided - do search
+        companies = h.search_company()
+        if companies is not None:
+            if args.json:
+                companies_out = [{k: v for k, v in c.items() if not k.startswith('_')} for c in companies]
+                print(json.dumps(companies_out, cls=DateTimeEncoder))
+            else:
+                for c in companies:
+                    pr_company_info(c)
