@@ -604,7 +604,7 @@ class HandelsRegister:
             clean_name = re.sub(r'\s+(GmbH|AG|UG|KG|OHG|e\.V\.|eG|mbH|SE|Co\.|&|und)\s*', ' ', company_name, flags=re.IGNORECASE)
             words = clean_name.strip().split()
             # Use first word as core search term (usually the distinctive part)
-            search_term = words[0] if words else company_name
+            search_term = clean_name.strip() if clean_name.strip() else company_name
             
             if self.args.debug:
                 print(f"Searching for '{search_term}' (extracted from '{company_name}')")
@@ -932,7 +932,9 @@ if __name__ == "__main__":
             else:
                 pr_company_info(company)
         else:
-            if not args.json:
+            if args.json:
+                print(json.dumps({"error": "Company not found", "register_number": args.register_number}))
+            else:
                 print(f"Company with register number {args.register_number} not found.")
     else:
         # Only company name/keywords provided - do search
