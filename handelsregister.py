@@ -617,9 +617,17 @@ class HandelsRegister:
             # Remove common suffixes like "GmbH", "AG", etc.
             import re
             clean_name = re.sub(r'\s+(GmbH|AG|UG|KG|OHG|e\.V\.|eG|mbH|SE|Co\.|&|und)\s*', ' ', company_name, flags=re.IGNORECASE)
+            
+            # Remove content within brackets specifically for the search term, as it often contains variable location info
+            # or creates issues with the search engine
+            clean_name = re.sub(r'\(.*?\)', '', clean_name)
+            
+            # Also remove special characters that might break search
+            clean_name = re.sub(r'[^\w\s]', ' ', clean_name)
+            
             words = clean_name.strip().split()
-            # Use first word as core search term (usually the distinctive part)
-            search_term = clean_name.strip() if clean_name.strip() else company_name
+            # Use cleaned name as search term, but condensed
+            search_term = " ".join(words) if words else company_name
             
             if self.args.debug:
                 print(f"Searching for '{search_term}' (extracted from '{company_name}')")
@@ -654,10 +662,14 @@ class HandelsRegister:
                 company_name_lower = company_name.lower()
                 name_filtered = [c for c in companies if c.get('name', '').lower() == company_name_lower]
             
-            # If still no match, try substring match
+            # If still no match, try substring match (both directions)
             if not name_filtered:
                 company_name_lower = company_name.lower()
-                name_filtered = [c for c in companies if company_name_lower in c.get('name', '').lower()]
+                name_filtered = [
+                    c for c in companies 
+                    if company_name_lower in c.get('name', '').lower() 
+                    or c.get('name', '').lower() in company_name_lower
+                ]
             
             if name_filtered:
                 companies = name_filtered
