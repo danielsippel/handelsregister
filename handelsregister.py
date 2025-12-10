@@ -9,7 +9,9 @@ import tempfile
 import mechanize
 import re
 import pathlib
+# Force update for live deployment
 import sys
+
 from bs4 import BeautifulSoup
 import urllib.parse
 import datetime
